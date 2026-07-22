@@ -5,10 +5,21 @@ on:
     # Daily at 12:00 UTC.
     - cron: "0 12 * * *"
   workflow_dispatch:
+    inputs:
+      limit:
+        description: "Manual test limit. Leave empty to sync all games."
+        required: false
+        default: ""
+      dry_run:
+        description: "Fetch data without writing to Notion."
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,4 +59,10 @@ jobs:
           ABANDONED_DAYS: ${{ secrets.ABANDONED_DAYS }}
           HTTP_TIMEOUT: ${{ secrets.HTTP_TIMEOUT }}
           HTTP_RETRIES: ${{ secrets.HTTP_RETRIES }}
-        run: python main.py --debug
+          SYNC_LIMIT: ${{ inputs.limit }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          echo "SteamShelf sync started at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          python -u main.py --debug
+          echo "SteamShelf sync finished at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"

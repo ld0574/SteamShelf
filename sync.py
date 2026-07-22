@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -1473,6 +1474,8 @@ def configure_logging(debug: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
+        stream=sys.stdout,
+        force=True,
     )
 
 
@@ -1494,6 +1497,14 @@ def run(argv: list[str] | None = None) -> None:
     configure_logging(args.debug)
     load_dotenv()
     config = Config.from_env(args)
+    LOG.info(
+        "SteamShelf 启动：账号 %s 个，limit=%s，dry_run=%s，抓商店=%s，抓网页库=%s",
+        len(config.accounts),
+        config.limit or "全部",
+        config.dry_run,
+        config.fetch_store_metadata,
+        config.fetch_web_library,
+    )
 
     http = HttpClient(timeout=config.http_timeout, retries=config.http_retries)
     steam = SteamClient(http, config)
