@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+app.log
+upload_log.txt
+steam_games.csv
+Steam Data.xlsx

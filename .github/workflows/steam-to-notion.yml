@@ -1,0 +1,50 @@
+name: SteamShelf Sync
+
+on:
+  schedule:
+    # Daily at 12:00 UTC.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Sync Steam library to Notion
+        env:
+          STEAM_API_KEY: ${{ secrets.STEAM_API_KEY }}
+          STEAM_USER_ID: ${{ secrets.STEAM_USER_ID }}
+          STEAM_PROFILE_ID: ${{ secrets.STEAM_PROFILE_ID }}
+          STEAM_ACCOUNT_NAME: ${{ secrets.STEAM_ACCOUNT_NAME }}
+          STEAM_ACCOUNTS: ${{ secrets.STEAM_ACCOUNTS }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_SCHEMA: ${{ vars.NOTION_SCHEMA }}
+          INCLUDE_PLAYED_FREE_GAMES: ${{ secrets.INCLUDE_PLAYED_FREE_GAMES }}
+          ENABLE_ITEM_UPDATE: ${{ secrets.ENABLE_ITEM_UPDATE }}
+          ENABLE_FILTER: ${{ secrets.ENABLE_FILTER }}
+          FETCH_WEB_LIBRARY: ${{ secrets.FETCH_WEB_LIBRARY }}
+          FETCH_STORE_METADATA: ${{ secrets.FETCH_STORE_METADATA }}
+          SYNC_MAIN_GAMES_ONLY: ${{ secrets.SYNC_MAIN_GAMES_ONLY }}
+          SKIP_PLAYTIME_WEB: ${{ secrets.SKIP_PLAYTIME_WEB }}
+          USE_ACCOUNT_FIELD: ${{ secrets.USE_ACCOUNT_FIELD }}
+          TOP_TAGS: ${{ secrets.TOP_TAGS }}
+          VERIFY_COVER_URLS: ${{ secrets.VERIFY_COVER_URLS }}
+          STORE_FAILURE_LIMIT: ${{ secrets.STORE_FAILURE_LIMIT }}
+          HTTP_TIMEOUT: ${{ secrets.HTTP_TIMEOUT }}
+          HTTP_RETRIES: ${{ secrets.HTTP_RETRIES }}
+        run: python main.py --debug
