@@ -45,6 +45,7 @@ jobs:
           TOP_TAGS: ${{ secrets.TOP_TAGS }}
           VERIFY_COVER_URLS: ${{ secrets.VERIFY_COVER_URLS }}
           STORE_FAILURE_LIMIT: ${{ secrets.STORE_FAILURE_LIMIT }}
+          ABANDONED_DAYS: ${{ secrets.ABANDONED_DAYS }}
           HTTP_TIMEOUT: ${{ secrets.HTTP_TIMEOUT }}
           HTTP_RETRIES: ${{ secrets.HTTP_RETRIES }}
         run: python main.py --debug

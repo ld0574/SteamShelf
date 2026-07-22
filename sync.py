@@ -65,6 +65,7 @@ class Config:
     top_tags: int = 5
     verify_cover_urls: bool = False
     store_failure_limit: int = 3
+    abandoned_days: int = 180
     http_timeout: int = 15
     http_retries: int = 2
     request_delay: float = 0.4
@@ -112,6 +113,7 @@ class Config:
             top_tags=max(0, env_int("TOP_TAGS", 5)),
             verify_cover_urls=env_bool("VERIFY_COVER_URLS", False),
             store_failure_limit=max(1, env_int("STORE_FAILURE_LIMIT", 3)),
+            abandoned_days=max(31, env_int("ABANDONED_DAYS", 180)),
             http_timeout=max(5, env_int("HTTP_TIMEOUT", 15)),
             http_retries=max(1, env_int("HTTP_RETRIES", 2)),
             request_delay=max(0.0, env_float("REQUEST_DELAY", 0.4)),
@@ -846,7 +848,10 @@ class SteamClient:
             "所属账户": account.account_name,
             "游戏简介": store.get("description") or "",
         }
-        record["游玩状态"] = get_game_status(record)
+        record["游玩状态"] = get_game_status(
+            record,
+            abandoned_days=self.config.abandoned_days,
+        )
         return record
 
 
@@ -1082,7 +1087,7 @@ class NotionClient:
             raise SyncError(f"有 {failed} 条记录写入失败")
 
 
-def get_game_status(record: dict[str, Any]) -> str | None:
+def get_game_status(record: dict[str, Any], abandoned_days: int = 180) -> str | None:
     content_type = text_or_none(record.get("内容类型")) or ""
     if content_type != "游戏本体":
         return None
@@ -1097,7 +1102,11 @@ def get_game_status(record: dict[str, Any]) -> str | None:
         return "未开始"
 
     if not total_achievements or total_achievements <= 0:
-        return status_from_last_played(last_played, hours)
+        return status_from_last_played(
+            last_played,
+            hours,
+            abandoned_days=abandoned_days,
+        )
 
     if achievements >= total_achievements:
         return "全成就"
@@ -1110,7 +1119,11 @@ def get_game_status(record: dict[str, Any]) -> str | None:
             if hours == 0:
                 return "未开始"
             if hours < 2:
-                return status_from_last_played(last_played, hours)
+                return status_from_last_played(
+                    last_played,
+                    hours,
+                    abandoned_days=abandoned_days,
+                )
         if last_played and first_achievement:
             days_between = (
                 datetime.fromisoformat(last_played).date()
@@ -1119,15 +1132,23 @@ def get_game_status(record: dict[str, Any]) -> str | None:
             if days_between >= 180 and hours < 5 and progress < 0.2:
                 return "已弃坑"
 
-    return status_from_last_played(last_played, hours)
+    return status_from_last_played(
+        last_played,
+        hours,
+        abandoned_days=abandoned_days,
+    )
 
 
-def status_from_last_played(last_played: str | None, hours: float) -> str:
+def status_from_last_played(
+    last_played: str | None,
+    hours: float,
+    abandoned_days: int = 180,
+) -> str:
     if last_played:
         days_since = (date.today() - datetime.fromisoformat(last_played).date()).days
         if days_since <= 30:
             return "游玩中"
-        if days_since <= 550:
+        if days_since <= abandoned_days:
             return "暂搁置"
         return "已弃坑"
     if hours > 0:
