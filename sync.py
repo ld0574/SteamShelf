@@ -1112,27 +1112,6 @@ def get_game_status(record: dict[str, Any], abandoned_days: int = 180) -> str | 
     if achievements >= total_achievements:
         return "全成就"
 
-    if total_achievements > 0:
-        progress = achievements / total_achievements
-        if progress >= 0.4:
-            return "已通关"
-        if achievements == 0 and not first_achievement:
-            if hours == 0:
-                return "未开始"
-            if hours < 2:
-                return status_from_last_played(
-                    last_played,
-                    hours,
-                    abandoned_days=abandoned_days,
-                )
-        if last_played and first_achievement:
-            days_between = (
-                datetime.fromisoformat(last_played).date()
-                - datetime.fromisoformat(first_achievement).date()
-            ).days
-            if days_between >= 180 and hours < 5 and progress < 0.2:
-                return "已弃坑"
-
     return status_from_last_played(
         last_played,
         hours,
