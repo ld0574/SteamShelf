@@ -677,9 +677,15 @@ class SteamClient:
     ) -> dict[str, Any]:
         cached = self.lookup_store_metadata(appid, account, api_name)
         if cached and not self.config.refresh_store_metadata:
-            if cached_store_info_complete(cached) or not self.config.fetch_store_metadata:
+            missing_fields = missing_store_metadata_fields(cached)
+            if not missing_fields or not self.config.fetch_store_metadata:
                 self._store_cache_hits += 1
                 return cached
+            LOG.debug(
+                "AppID %s Notion 元数据缺失：%s",
+                appid,
+                ", ".join(missing_fields),
+            )
             self._store_cache_misses += 1
         elif self.store_metadata_cache and not cached:
             self._store_cache_misses += 1
@@ -711,6 +717,17 @@ class SteamClient:
             "music": "原声音轨",
             "demo": "试玩版",
         }.get(str(data.get("type", "")).lower(), "其它")
+        tags = html_info.get("tags") or [
+            str(genre.get("description", "")).strip()
+            for genre in data.get("genres") or []
+            if str(genre.get("description", "")).strip()
+        ]
+        cover_url = (
+            data.get("header_image")
+            or data.get("capsule_image")
+            or data.get("capsule_imagev5")
+            or self.get_cover_url(appid)
+        )
 
         self._store_fetches += 1
         return {
@@ -722,9 +739,10 @@ class SteamClient:
             "developers": ", ".join(data.get("developers") or []),
             "publishers": ", ".join(data.get("publishers") or []),
             "release_date": parse_date((data.get("release_date") or {}).get("date")),
-            "tags": html_info.get("tags") or [],
+            "tags": tags,
             "content_type": content_type,
             "region": region,
+            "cover_url": cover_url,
         }
 
     def lookup_store_metadata(
@@ -1392,18 +1410,22 @@ def cached_store_info_has_any(store: dict[str, Any]) -> bool:
     )
 
 
-def cached_store_info_complete(store: dict[str, Any]) -> bool:
+def missing_store_metadata_fields(store: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not text_or_none(store.get("cover_url")):
+        missing.append("封面")
+    if not normalize_tags(store.get("tags")):
+        missing.append("商店标签")
+    if not (
+        text_or_none(store.get("developers"))
+        or text_or_none(store.get("publishers"))
+    ):
+        missing.append("开发商/发行商")
+    if not text_or_none(store.get("description")):
+        missing.append("游戏简介")
     if not text_or_none(store.get("content_type")):
-        return False
-    return any(
-        [
-            text_or_none(store.get("description")),
-            text_or_none(store.get("developers")),
-            text_or_none(store.get("publishers")),
-            parse_date(store.get("release_date")),
-            normalize_tags(store.get("tags")),
-        ]
-    )
+        missing.append("内容类型")
+    return missing
 
 
 def unique_keys(keys: list[str | None]) -> list[str]:
