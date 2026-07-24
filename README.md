@@ -96,16 +96,16 @@ NOTION_DATABASE_ID=你的 Notion database id
 NOTION_SCHEMA=cn
 ```
 
-先同步 1 个游戏测试：
+运行同步：
 
 ```bash
-python main.py --limit 1 --debug
+python main.py --debug
 ```
 
 只抓数据、不写 Notion：
 
 ```bash
-python main.py --dry-run --limit 10 --export-csv steam_games.csv
+python main.py --dry-run --export-csv steam_games.csv
 ```
 
 导出 Excel：
@@ -123,6 +123,10 @@ python main.py --dry-run --export-xlsx "Steam Data.xlsx"
 ```
 
 默认每天 `12:00 UTC` 自动运行，也可以在 GitHub 的 Actions 页面手动触发。
+
+Actions 每次运行都会先读取 Notion 已有页面，并把已有的开发商、发行商、标签、简介、内容类型、封面当作缓存复用。已有元数据的游戏不会再请求 Steam 商店；只有新游戏或元数据明显缺失的游戏才会补查商店信息。日常同步主要更新游玩时长、最后游玩日期、成就进度和游玩状态。
+
+如果你想重新刷新已有的商店元数据，可以手动运行 workflow，并勾选 `refresh_store_metadata`。
 
 需要配置这些 Secrets：
 
@@ -145,7 +149,8 @@ python main.py --dry-run --export-xlsx "Steam Data.xlsx"
 | `ENABLE_ITEM_UPDATE` | `true` | 已存在的 Notion 页面是否更新 |
 | `ENABLE_FILTER` | `false` | 是否过滤短时长且无成就的记录 |
 | `FETCH_WEB_LIBRARY` | `false` | 是否抓取 Steam XML 游戏库补充网页来源游戏 |
-| `FETCH_STORE_METADATA` | `true` | 是否抓取商店开发商、发行商、标签、简介、内容类型等 |
+| `FETCH_STORE_METADATA` | `true` | 是否抓取缺失的商店开发商、发行商、标签、简介、内容类型等 |
+| `REFRESH_STORE_METADATA` | `false` | 是否忽略 Notion 已有元数据并强制重新抓取 |
 | `SYNC_MAIN_GAMES_ONLY` | `true` | 是否跳过 DLC、试玩版、原声音轨 |
 | `SKIP_PLAYTIME_WEB` | `true` | 网页来源记录不更新游玩时间类字段 |
 | `USE_ACCOUNT_FIELD` | 多账号时为 `true` | 用 `游戏ID + 所属账户` 作为匹配 key |
@@ -155,6 +160,7 @@ python main.py --dry-run --export-xlsx "Steam Data.xlsx"
 | `ABANDONED_DAYS` | `180` | 最后游玩超过多少天后标为 `已弃坑` |
 | `HTTP_TIMEOUT` | `15` | 单次 HTTP 请求超时秒数 |
 | `HTTP_RETRIES` | `2` | 单个请求最大尝试次数 |
+| `REQUEST_DELAY` | `0.4` | 每条记录之间的等待秒数；Actions 默认传入 `0.25` |
 
 多账号示例：
 

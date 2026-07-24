@@ -66,6 +66,7 @@ class Config:
     top_tags: int = 5
     verify_cover_urls: bool = False
     store_failure_limit: int = 3
+    refresh_store_metadata: bool = False
     abandoned_days: int = 180
     http_timeout: int = 15
     http_retries: int = 2
@@ -73,7 +74,6 @@ class Config:
     export_csv_path: str | None = None
     export_xlsx_path: str | None = None
     dry_run: bool = False
-    limit: int | None = None
     mark_uploaded: bool = True
     set_page_cover: bool = True
     set_page_icon: bool = True
@@ -114,6 +114,7 @@ class Config:
             top_tags=max(0, env_int("TOP_TAGS", 5)),
             verify_cover_urls=env_bool("VERIFY_COVER_URLS", False),
             store_failure_limit=max(1, env_int("STORE_FAILURE_LIMIT", 3)),
+            refresh_store_metadata=env_bool("REFRESH_STORE_METADATA", False),
             abandoned_days=max(31, env_int("ABANDONED_DAYS", 180)),
             http_timeout=max(5, env_int("HTTP_TIMEOUT", 15)),
             http_retries=max(1, env_int("HTTP_RETRIES", 2)),
@@ -121,7 +122,6 @@ class Config:
             export_csv_path=args.export_csv or env_any("EXPORT_CSV_PATH", default=""),
             export_xlsx_path=args.export_xlsx or env_any("EXPORT_XLSX_PATH", default=""),
             dry_run=args.dry_run or env_bool("DRY_RUN", False),
-            limit=args.limit or env_int("SYNC_LIMIT", 0) or None,
             mark_uploaded=env_bool("MARK_UPLOADED", True),
             set_page_cover=env_bool("SET_PAGE_COVER", True),
             set_page_icon=env_bool("SET_PAGE_ICON", True),
@@ -136,6 +136,16 @@ class Config:
         if not cfg.dry_run and (not cfg.notion_api_key or not cfg.notion_database_id):
             raise SyncError("同步到 Notion 需要设置 NOTION_API_KEY 和 NOTION_DATABASE_ID")
         return cfg
+
+
+@dataclass
+class NotionSyncContext:
+    db_props: dict[str, str]
+    title_prop: str
+    field_defs: list[FieldDef]
+    existing_pages: dict[str, str]
+    key_property: str | None
+    store_metadata_cache: dict[str, dict[str, Any]]
 
 
 FIELD_DEFS_CN: list[FieldDef] = [
@@ -474,12 +484,21 @@ class HttpClient:
 
 
 class SteamClient:
-    def __init__(self, http: HttpClient, config: Config) -> None:
+    def __init__(
+        self,
+        http: HttpClient,
+        config: Config,
+        store_metadata_cache: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self.http = http
         self.config = config
+        self.store_metadata_cache = store_metadata_cache or {}
         self._steam_id64_cache: dict[str, str] = {}
         self._store_network_failures = 0
         self._store_metadata_disabled = False
+        self._store_cache_hits = 0
+        self._store_cache_misses = 0
+        self._store_fetches = 0
 
     def resolve_steam_id64(self, account: Account) -> str:
         raw_id = account.steam_id.strip()
@@ -653,9 +672,20 @@ class SteamClient:
             first_unlock = timestamp_to_date(first_unlock_time)
         return {"total": len(achievements), "achieved": len(unlocked), "first_unlock": first_unlock}
 
-    def get_store_info(self, appid: int) -> dict[str, Any]:
+    def get_store_info(
+        self, appid: int, account: Account, api_name: str | None = None
+    ) -> dict[str, Any]:
+        cached = self.lookup_store_metadata(appid, account, api_name)
+        if cached and not self.config.refresh_store_metadata:
+            if cached_store_info_complete(cached) or not self.config.fetch_store_metadata:
+                self._store_cache_hits += 1
+                return cached
+            self._store_cache_misses += 1
+        elif self.store_metadata_cache and not cached:
+            self._store_cache_misses += 1
+
         if not self.config.fetch_store_metadata or self._store_metadata_disabled:
-            return self.empty_store_info()
+            return cached or self.empty_store_info()
 
         data, region, network_failed = self.fetch_appdetails(appid, "cn", "zh-cn")
         if data is None:
@@ -671,7 +701,7 @@ class SteamClient:
                         "Steam 商店接口连续失败 %s 次，后续本次运行将跳过商店元数据",
                         self._store_network_failures,
                     )
-            return self.empty_store_info(region=region or "未知")
+            return cached or self.empty_store_info(region=region or "未知")
 
         html_info = self.fetch_store_html_info(appid)
 
@@ -682,6 +712,7 @@ class SteamClient:
             "demo": "试玩版",
         }.get(str(data.get("type", "")).lower(), "其它")
 
+        self._store_fetches += 1
         return {
             "store_name": data.get("name"),
             "cn_title": html_info.get("cn_title") or data.get("name"),
@@ -695,6 +726,22 @@ class SteamClient:
             "content_type": content_type,
             "region": region,
         }
+
+    def lookup_store_metadata(
+        self, appid: int, account: Account, api_name: str | None
+    ) -> dict[str, Any] | None:
+        if not self.store_metadata_cache:
+            return None
+        for key in metadata_lookup_keys(
+            appid=appid,
+            title=api_name,
+            account_name=account.account_name,
+            use_account_field=self.config.use_account_field,
+        ):
+            cached = self.store_metadata_cache.get(key)
+            if cached:
+                return cached
+        return None
 
     def empty_store_info(self, region: str = "未知") -> dict[str, Any]:
         return {
@@ -783,7 +830,6 @@ class SteamClient:
 
     def build_dataframe(self) -> pd.DataFrame:
         records: list[dict[str, Any]] = []
-        processed = 0
         for account in self.config.accounts:
             LOG.info("开始抓取账号 %s", account.account_name)
             api_games = self.get_owned_games(account)
@@ -794,24 +840,26 @@ class SteamClient:
             )
 
             for index, game in games.iterrows():
-                if self.config.limit and processed >= self.config.limit:
-                    break
-                processed += 1
                 appid = int(game["appid"])
                 name = text_or_none(game.get("name")) or f"App {appid}"
                 LOG.info("[%s/%s] 处理 %s", index + 1, len(games), name)
                 records.append(self.build_record(account, game))
                 if self.config.request_delay:
                     time.sleep(self.config.request_delay)
-            if self.config.limit and processed >= self.config.limit:
-                break
 
+        if self.store_metadata_cache:
+            LOG.info(
+                "商店元数据缓存：命中 %s，缺失/不完整 %s，实际抓取 %s",
+                self._store_cache_hits,
+                self._store_cache_misses,
+                self._store_fetches,
+            )
         return pd.DataFrame(records)
 
     def build_record(self, account: Account, game: pd.Series) -> dict[str, Any]:
         appid = int(game["appid"])
         api_name = text_or_none(game.get("name"))
-        store = self.get_store_info(appid)
+        store = self.get_store_info(appid, account, api_name)
         achievements = self.get_achievements(account, appid)
 
         minutes = number_or_none(game.get("playtime_forever"))
@@ -845,7 +893,7 @@ class SteamClient:
             "数据源": "Steam",
             "抓取来源": game.get("抓取来源"),
             "内容类型": content_type,
-            "封面": self.get_cover_url(appid),
+            "封面": store.get("cover_url") or self.get_cover_url(appid),
             "所属账户": account.account_name,
             "游戏简介": store.get("description") or "",
         }
@@ -942,12 +990,43 @@ class NotionClient:
             body["start_cursor"] = start_cursor
         return self.http.request("POST", url, headers=self.headers, json=body).json()
 
+    def prepare_sync_context(self) -> NotionSyncContext:
+        database = self.retrieve_database()
+        raw_props = database.get("properties", {})
+        db_props = {name: meta.get("type", "") for name, meta in raw_props.items()}
+        title_prop = find_title_property(db_props)
+        if not title_prop:
+            raise SyncError("Notion 数据库中没有 title 属性")
+
+        field_defs = FIELD_DEFS_CN if self.config.schema == "cn" else FIELD_DEFS_LEGACY
+        db_props = self.ensure_database_schema(db_props, title_prop, field_defs)
+        existing_pages, key_property, store_metadata_cache = self.fetch_existing_pages(
+            db_props,
+            title_prop,
+            field_defs,
+        )
+        LOG.info("Notion 已有记录 %s 条", len(existing_pages))
+        if store_metadata_cache:
+            LOG.info("已从 Notion 读取商店元数据缓存 %s 条", len(store_metadata_cache))
+        return NotionSyncContext(
+            db_props=db_props,
+            title_prop=title_prop,
+            field_defs=field_defs,
+            existing_pages=existing_pages,
+            key_property=key_property,
+            store_metadata_cache=store_metadata_cache,
+        )
+
     def fetch_existing_pages(
-        self, db_props: dict[str, str], title_prop: str
-    ) -> tuple[dict[str, str], str | None]:
+        self,
+        db_props: dict[str, str],
+        title_prop: str,
+        field_defs: list[FieldDef],
+    ) -> tuple[dict[str, str], str | None, dict[str, dict[str, Any]]]:
         key_property = choose_key_property(self.config.schema, db_props)
         account_property = choose_account_property(db_props) if self.config.use_account_field else None
         existing: dict[str, str] = {}
+        store_metadata_cache: dict[str, dict[str, Any]] = {}
         cursor = None
 
         while True:
@@ -963,10 +1042,18 @@ class NotionClient:
                 )
                 for key in keys:
                     existing[key] = page["id"]
+                cached_store = cached_store_info_from_props(
+                    props,
+                    title_prop=title_prop,
+                    field_defs=field_defs,
+                )
+                if cached_store:
+                    for key in keys:
+                        store_metadata_cache.setdefault(key, cached_store)
             if not payload.get("has_more"):
                 break
             cursor = payload.get("next_cursor")
-        return existing, key_property
+        return existing, key_property, store_metadata_cache
 
     def create_page(self, properties: dict[str, Any], record: dict[str, Any]) -> None:
         body: dict[str, Any] = {
@@ -1000,18 +1087,15 @@ class NotionClient:
         if self.config.set_page_icon:
             body["icon"] = {"type": "external", "external": {"url": STEAM_LOGO_URL}}
 
-    def sync_dataframe(self, df: pd.DataFrame) -> None:
-        database = self.retrieve_database()
-        raw_props = database.get("properties", {})
-        db_props = {name: meta.get("type", "") for name, meta in raw_props.items()}
-        title_prop = find_title_property(db_props)
-        if not title_prop:
-            raise SyncError("Notion 数据库中没有 title 属性")
-
-        field_defs = FIELD_DEFS_CN if self.config.schema == "cn" else FIELD_DEFS_LEGACY
-        db_props = self.ensure_database_schema(db_props, title_prop, field_defs)
-        existing_pages, key_property = self.fetch_existing_pages(db_props, title_prop)
-        LOG.info("Notion 已有记录 %s 条", len(existing_pages))
+    def sync_dataframe(
+        self, df: pd.DataFrame, context: NotionSyncContext | None = None
+    ) -> None:
+        context = context or self.prepare_sync_context()
+        db_props = context.db_props
+        title_prop = context.title_prop
+        field_defs = context.field_defs
+        existing_pages = context.existing_pages
+        key_property = context.key_property
 
         created = 0
         updated = 0
@@ -1232,6 +1316,16 @@ def extract_prop_value(prop: dict[str, Any]) -> Any:
         return "".join(item.get("plain_text", "") for item in value or [])
     if prop_type in {"select", "status"}:
         return (value or {}).get("name")
+    if prop_type == "multi_select":
+        return [item.get("name") for item in value or [] if item.get("name")]
+    if prop_type == "files":
+        files = value or []
+        for item in files:
+            file_type = item.get("type")
+            url = (item.get(file_type) or {}).get("url")
+            if url:
+                return url
+        return None
     if prop_type == "number":
         return value
     if prop_type == "date":
@@ -1239,6 +1333,77 @@ def extract_prop_value(prop: dict[str, Any]) -> Any:
     if prop_type == "url":
         return value
     return None
+
+
+def cached_store_info_from_props(
+    props: dict[str, Any],
+    title_prop: str,
+    field_defs: list[FieldDef],
+) -> dict[str, Any] | None:
+    values: dict[str, Any] = {}
+    wanted = {
+        "游戏名称",
+        "封面",
+        "开发商",
+        "发行商",
+        "发售日期",
+        "商店标签",
+        "内容类型",
+        "游戏简介",
+    }
+    for field in field_defs:
+        if field.record_key not in wanted:
+            continue
+        prop_name = field.notion_name
+        if field.notion_type == "title" and prop_name not in props:
+            prop_name = title_prop
+        if prop_name in props:
+            values[field.record_key] = extract_prop_value(props[prop_name])
+
+    store = {
+        "store_name": text_or_none(values.get("游戏名称")),
+        "cn_title": text_or_none(values.get("游戏名称")),
+        "description": text_or_none(values.get("游戏简介")) or "",
+        "developers": text_or_none(values.get("开发商")) or "",
+        "publishers": text_or_none(values.get("发行商")) or "",
+        "release_date": parse_date(values.get("发售日期")),
+        "tags": normalize_tags(values.get("商店标签")),
+        "content_type": text_or_none(values.get("内容类型")) or "游戏本体",
+        "region": "Notion",
+        "cover_url": text_or_none(values.get("封面")),
+    }
+    if cached_store_info_has_any(store):
+        return store
+    return None
+
+
+def cached_store_info_has_any(store: dict[str, Any]) -> bool:
+    return any(
+        [
+            text_or_none(store.get("store_name")),
+            text_or_none(store.get("cn_title")),
+            text_or_none(store.get("description")),
+            text_or_none(store.get("developers")),
+            text_or_none(store.get("publishers")),
+            parse_date(store.get("release_date")),
+            normalize_tags(store.get("tags")),
+            text_or_none(store.get("cover_url")),
+        ]
+    )
+
+
+def cached_store_info_complete(store: dict[str, Any]) -> bool:
+    if not text_or_none(store.get("content_type")):
+        return False
+    return any(
+        [
+            text_or_none(store.get("description")),
+            text_or_none(store.get("developers")),
+            text_or_none(store.get("publishers")),
+            parse_date(store.get("release_date")),
+            normalize_tags(store.get("tags")),
+        ]
+    )
 
 
 def unique_keys(keys: list[str | None]) -> list[str]:
@@ -1276,6 +1441,24 @@ def page_keys_from_props(
             keys.append(f"{base}_未知")
         keys.append(base)
     return unique_keys(keys)
+
+
+def metadata_lookup_keys(
+    appid: int,
+    title: str | None,
+    account_name: str,
+    use_account_field: bool,
+) -> list[str]:
+    record = {
+        "游戏ID": appid,
+        "游戏名称": title,
+        "所属账户": account_name,
+    }
+    return record_keys(
+        record,
+        key_property="游戏ID",
+        use_account_field=use_account_field,
+    )
 
 
 def record_keys(
@@ -1464,7 +1647,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--debug", action="store_true", help="输出调试日志")
     parser.add_argument("--dry-run", action="store_true", help="只抓取和导出，不写入 Notion")
-    parser.add_argument("--limit", type=int, help="限制处理的游戏数量，便于测试")
     parser.add_argument("--schema", choices=["cn", "legacy"], help="Notion 字段预设")
     parser.add_argument("--export-csv", help="导出 CSV 的路径")
     parser.add_argument("--export-xlsx", help="导出 Excel 的路径")
@@ -1477,16 +1659,28 @@ def run(argv: list[str] | None = None) -> None:
     load_dotenv()
     config = Config.from_env(args)
     LOG.info(
-        "SteamShelf 启动：账号 %s 个，limit=%s，dry_run=%s，抓商店=%s，抓网页库=%s",
+        "SteamShelf 启动：账号 %s 个，dry_run=%s，抓商店=%s，强制刷新商店=%s，抓网页库=%s",
         len(config.accounts),
-        config.limit or "全部",
         config.dry_run,
         config.fetch_store_metadata,
+        config.refresh_store_metadata,
         config.fetch_web_library,
     )
 
     http = HttpClient(timeout=config.http_timeout, retries=config.http_retries)
-    steam = SteamClient(http, config)
+    notion = None
+    notion_context = None
+    if not config.dry_run:
+        notion = NotionClient(http, config)
+        notion_context = notion.prepare_sync_context()
+
+    steam = SteamClient(
+        http,
+        config,
+        store_metadata_cache=(
+            notion_context.store_metadata_cache if notion_context else None
+        ),
+    )
     df = steam.build_dataframe()
     LOG.info("DataFrame 构建完成：%s 行，%s 列", len(df), len(df.columns))
     export_dataframe(df, config)
@@ -1495,8 +1689,9 @@ def run(argv: list[str] | None = None) -> None:
         LOG.info("DRY_RUN=true，已跳过 Notion 写入")
         return
 
-    notion = NotionClient(http, config)
-    notion.sync_dataframe(df)
+    if notion is None:
+        notion = NotionClient(http, config)
+    notion.sync_dataframe(df, notion_context)
 
 
 if __name__ == "__main__":

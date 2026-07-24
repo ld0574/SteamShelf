@@ -6,20 +6,25 @@ on:
     - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
-      limit:
-        description: "Manual test limit. Leave empty to sync all games."
-        required: false
-        default: ""
       dry_run:
         description: "Fetch data without writing to Notion."
         required: false
         default: false
         type: boolean
+      refresh_store_metadata:
+        description: "Refresh existing store metadata instead of only filling missing values."
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: steam-shelf-sync
+  cancel-in-progress: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +54,8 @@ jobs:
           ENABLE_ITEM_UPDATE: ${{ secrets.ENABLE_ITEM_UPDATE }}
           ENABLE_FILTER: ${{ secrets.ENABLE_FILTER }}
           FETCH_WEB_LIBRARY: ${{ secrets.FETCH_WEB_LIBRARY }}
-          FETCH_STORE_METADATA: ${{ secrets.FETCH_STORE_METADATA }}
+          FETCH_STORE_METADATA: "true"
+          REFRESH_STORE_METADATA: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_store_metadata || 'false' }}
           SYNC_MAIN_GAMES_ONLY: ${{ secrets.SYNC_MAIN_GAMES_ONLY }}
           SKIP_PLAYTIME_WEB: ${{ secrets.SKIP_PLAYTIME_WEB }}
           USE_ACCOUNT_FIELD: ${{ secrets.USE_ACCOUNT_FIELD }}
@@ -59,8 +65,8 @@ jobs:
           ABANDONED_DAYS: ${{ secrets.ABANDONED_DAYS }}
           HTTP_TIMEOUT: ${{ secrets.HTTP_TIMEOUT }}
           HTTP_RETRIES: ${{ secrets.HTTP_RETRIES }}
-          SYNC_LIMIT: ${{ inputs.limit }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          REQUEST_DELAY: ${{ secrets.REQUEST_DELAY || '0.25' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           PYTHONUNBUFFERED: "1"
         run: |
           echo "SteamShelf sync started at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
