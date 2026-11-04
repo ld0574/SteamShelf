@@ -16,6 +16,19 @@ on:
         required: false
         default: false
         type: boolean
+      refresh_achievements:
+        description: "Refresh achievements for every game instead of reusing unchanged data."
+        required: false
+        default: false
+        type: boolean
+      extended_timeout:
+        description: "Allow up to 120 minutes for a large first import or full refresh."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 concurrency:
   group: steam-shelf-sync
@@ -24,10 +37,13 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: ${{ inputs.extended_timeout && 120 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -36,9 +52,7 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
 
       - name: Sync Steam library to Notion
         env:
@@ -56,6 +70,9 @@ jobs:
           FETCH_WEB_LIBRARY: ${{ secrets.FETCH_WEB_LIBRARY }}
           FETCH_STORE_METADATA: "true"
           REFRESH_STORE_METADATA: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_store_metadata || 'false' }}
+          STORE_METADATA_RETRY_DAYS: ${{ vars.STORE_METADATA_RETRY_DAYS || '7' }}
+          REFRESH_ACHIEVEMENTS: ${{ github.event_name == 'workflow_dispatch' && inputs.refresh_achievements || 'false' }}
+          ACHIEVEMENT_REFRESH_DAYS: ${{ vars.ACHIEVEMENT_REFRESH_DAYS || '30' }}
           SYNC_MAIN_GAMES_ONLY: ${{ secrets.SYNC_MAIN_GAMES_ONLY }}
           SKIP_PLAYTIME_WEB: ${{ secrets.SKIP_PLAYTIME_WEB }}
           USE_ACCOUNT_FIELD: ${{ secrets.USE_ACCOUNT_FIELD }}
@@ -70,5 +87,5 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           echo "SteamShelf sync started at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          python -u main.py --debug
+          python -u main.py
           echo "SteamShelf sync finished at $(date -u +'%Y-%m-%dT%H:%M:%SZ')"

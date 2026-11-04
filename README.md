@@ -124,9 +124,17 @@ python main.py --dry-run --export-xlsx "Steam Data.xlsx"
 
 默认每天 `12:00 UTC` 自动运行，也可以在 GitHub 的 Actions 页面手动触发。
 
-Actions 每次运行都会先读取 Notion 已有页面，并把已有的开发商、发行商、标签、简介、内容类型、封面当作缓存复用。已有元数据的游戏不会再请求 Steam 商店；如果缺少封面、商店标签、开发商/发行商、简介或内容类型，脚本会自动补查商店信息。日常同步主要更新游玩时长、最后游玩日期、成就进度和游玩状态。
+Actions 每次运行都会先读取 Notion 已有页面，复用商店元数据和成就数据，减少重复请求：
 
-如果你想重新刷新已有的商店元数据，可以手动运行 workflow，并勾选 `refresh_store_metadata`。
+- 成就只在新增游戏、缓存缺失、游玩时长或最后游玩日期变化、最近两天玩过时查询。其它游戏按 AppID 分散到 30 天内轮换刷新，以补充离线同步或成就规则变化。
+- 已有完整商店元数据的游戏不会再请求 Steam 商店。已有页面缺少封面、商店标签、开发商/发行商、简介或内容类型时，按 AppID 分散到 7 天内重试补齐；新游戏会立即查询。
+- 每天仍会重算游玩状态，并比较属性、封面和图标；只有实际变化才写入 Notion。缓存命中且没有发起请求的记录不会额外等待。
+
+Steam 成就接口临时失败时会保留已有成就，不会清零；后续按上述触发规则重试。没有可用成就缓存的游戏会在下次运行再次查询。
+
+可以手动运行 workflow，勾选 `refresh_store_metadata` 强制刷新商店元数据，或勾选 `refresh_achievements` 强制刷新全库成就。
+
+每次运行默认最多 30 分钟，防止异常请求持续消耗 Actions 时长。首次导入大游戏库或手动全量刷新时，可以勾选 `extended_timeout`，把本次上限提高到 120 分钟。达到上限会取消运行；已写入的数据会保留，下次运行会继续比较并同步。
 
 需要配置这些 Secrets：
 
@@ -151,6 +159,9 @@ Actions 每次运行都会先读取 Notion 已有页面，并把已有的开发�
 | `FETCH_WEB_LIBRARY` | `false` | 是否抓取 Steam XML 游戏库补充网页来源游戏 |
 | `FETCH_STORE_METADATA` | `true` | 是否抓取缺失的商店开发商、发行商、标签、简介、内容类型等 |
 | `REFRESH_STORE_METADATA` | `false` | 是否忽略 Notion 已有元数据并强制重新抓取 |
+| `STORE_METADATA_RETRY_DAYS` | `7` | 已有页面缺失商店元数据时，按 AppID 分散重试的天数；Actions 可通过同名 Repository variable 调整 |
+| `REFRESH_ACHIEVEMENTS` | `false` | 是否忽略已有成就缓存并强制查询全库成就 |
+| `ACHIEVEMENT_REFRESH_DAYS` | `30` | 未变化游戏的成就按 AppID 分散轮换刷新的天数；Actions 可通过同名 Repository variable 调整 |
 | `SYNC_MAIN_GAMES_ONLY` | `true` | 是否跳过 DLC、试玩版、原声音轨 |
 | `SKIP_PLAYTIME_WEB` | `true` | 网页来源记录不更新游玩时间类字段 |
 | `USE_ACCOUNT_FIELD` | 多账号时为 `true` | 用 `游戏ID + 所属账户` 作为匹配 key |
@@ -160,7 +171,7 @@ Actions 每次运行都会先读取 Notion 已有页面，并把已有的开发�
 | `ABANDONED_DAYS` | `180` | 最后游玩超过多少天后标为 `已弃坑` |
 | `HTTP_TIMEOUT` | `15` | 单次 HTTP 请求超时秒数 |
 | `HTTP_RETRIES` | `2` | 单个请求最大尝试次数 |
-| `REQUEST_DELAY` | `0.4` | 每条记录之间的等待秒数；Actions 默认传入 `0.25` |
+| `REQUEST_DELAY` | `0.4` | 实际发起请求的记录之间的等待秒数；Actions 默认传入 `0.25`，纯缓存命中或未变化记录不等待 |
 
 多账号示例：
 
