@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -9,7 +10,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import quote
@@ -67,6 +68,9 @@ class Config:
     verify_cover_urls: bool = False
     store_failure_limit: int = 3
     refresh_store_metadata: bool = False
+    refresh_achievements: bool = False
+    achievement_refresh_days: int = 30
+    store_metadata_retry_days: int = 7
     abandoned_days: int = 180
     http_timeout: int = 15
     http_retries: int = 2
@@ -115,6 +119,9 @@ class Config:
             verify_cover_urls=env_bool("VERIFY_COVER_URLS", False),
             store_failure_limit=max(1, env_int("STORE_FAILURE_LIMIT", 3)),
             refresh_store_metadata=env_bool("REFRESH_STORE_METADATA", False),
+            refresh_achievements=env_bool("REFRESH_ACHIEVEMENTS", False),
+            achievement_refresh_days=max(1, env_int("ACHIEVEMENT_REFRESH_DAYS", 30)),
+            store_metadata_retry_days=max(1, env_int("STORE_METADATA_RETRY_DAYS", 7)),
             abandoned_days=max(31, env_int("ABANDONED_DAYS", 180)),
             http_timeout=max(5, env_int("HTTP_TIMEOUT", 15)),
             http_retries=max(1, env_int("HTTP_RETRIES", 2)),
@@ -146,6 +153,7 @@ class NotionSyncContext:
     existing_pages: dict[str, str]
     key_property: str | None
     store_metadata_cache: dict[str, dict[str, Any]]
+    page_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 FIELD_DEFS_CN: list[FieldDef] = [
@@ -434,6 +442,7 @@ class HttpClient:
     def __init__(self, timeout: int = 25, retries: int = 3) -> None:
         self.timeout = timeout
         self.retries = retries
+        self.request_count = 0
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -446,12 +455,15 @@ class HttpClient:
         )
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        self.request_count += 1
         kwargs.setdefault("timeout", self.timeout)
         for attempt in range(1, self.retries + 1):
             response: requests.Response | None = None
             try:
                 response = self.session.request(method, url, **kwargs)
                 if response.status_code in {429, 500, 502, 503, 504}:
+                    if attempt >= self.retries:
+                        break
                     retry_after = response.headers.get("Retry-After")
                     delay = float(retry_after) if retry_after else min(2 * attempt, 10)
                     LOG.warning(
@@ -489,10 +501,15 @@ class SteamClient:
         http: HttpClient,
         config: Config,
         store_metadata_cache: dict[str, dict[str, Any]] | None = None,
+        achievement_cache: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.http = http
         self.config = config
         self.store_metadata_cache = store_metadata_cache or {}
+        self.achievement_cache = achievement_cache or {}
+        self._store_results: dict[int, dict[str, Any]] = {}
+        self._achievement_cache_hits = 0
+        self._achievement_fetches = 0
         self._steam_id64_cache: dict[str, str] = {}
         self._store_network_failures = 0
         self._store_metadata_disabled = False
@@ -641,6 +658,7 @@ class SteamClient:
         return merged.sort_values("name", na_position="last").reset_index(drop=True)
 
     def get_achievements(self, account: Account, appid: int) -> dict[str, Any]:
+        self._achievement_fetches += 1
         steam_id64 = self.resolve_steam_id64(account)
         params = {
             "key": self.config.steam_api_key,
@@ -654,8 +672,16 @@ class SteamClient:
                 params=params,
             )
             data = response.json().get("playerstats", {})
-        except SyncError:
-            return {"total": 0, "achieved": 0, "first_unlock": None}
+        except SyncError as exc:
+            if "Requested app has no stats" in str(exc):
+                return {"total": 0, "achieved": 0, "first_unlock": None}
+            raise
+
+        if not data.get("success"):
+            # Steam uses this error for games without achievement statistics.
+            if data.get("error") == "Requested app has no stats":
+                return {"total": 0, "achieved": 0, "first_unlock": None}
+            raise SyncError(f"AppID {appid} 成就数据不可用")
 
         achievements = data.get("achievements") or []
         if not isinstance(achievements, list):
@@ -672,13 +698,49 @@ class SteamClient:
             first_unlock = timestamp_to_date(first_unlock_time)
         return {"total": len(achievements), "achieved": len(unlocked), "first_unlock": first_unlock}
 
+    def achievements_for_game(
+        self, account: Account, game: pd.Series
+    ) -> dict[str, Any]:
+        appid = int(game["appid"])
+        cached = self.achievement_cache.get(
+            achievement_cache_key(appid, account.account_name, self.config.use_account_field)
+        )
+        minutes = number_or_none(game.get("playtime_forever"))
+        hours = round(minutes / 60, 2) if minutes is not None else None
+        last_played = timestamp_to_date(game.get("rtime_last_played"))
+        if (
+            cached
+            and not self.config.refresh_achievements
+            and hours is not None
+            and hours == cached["hours"]
+            and last_played == cached["last_played"]
+            and not recently_played(last_played, 2)
+            and not refresh_due(appid, self.config.achievement_refresh_days)
+        ):
+            self._achievement_cache_hits += 1
+            return cached["achievements"]
+        try:
+            return self.get_achievements(account, appid)
+        except SyncError as exc:
+            LOG.warning("AppID %s 成就请求失败，保留已有成就：%s", appid, exc)
+            if cached:
+                return cached["achievements"]
+            # Missing values are omitted from Notion writes and retried next run.
+            return {"total": None, "achieved": None, "first_unlock": None}
+
     def get_store_info(
         self, appid: int, account: Account, api_name: str | None = None
     ) -> dict[str, Any]:
+        if appid in self._store_results:
+            return self._store_results[appid]
         cached = self.lookup_store_metadata(appid, account, api_name)
         if cached and not self.config.refresh_store_metadata:
             missing_fields = missing_store_metadata_fields(cached)
-            if not missing_fields or not self.config.fetch_store_metadata:
+            if (
+                not missing_fields
+                or not self.config.fetch_store_metadata
+                or not refresh_due(appid, self.config.store_metadata_retry_days)
+            ):
                 self._store_cache_hits += 1
                 return cached
             LOG.debug(
@@ -707,7 +769,9 @@ class SteamClient:
                         "Steam 商店接口连续失败 %s 次，后续本次运行将跳过商店元数据",
                         self._store_network_failures,
                     )
-            return cached or self.empty_store_info(region=region or "未知")
+            result = cached or self.empty_store_info(region=region or "未知")
+            self._store_results[appid] = result
+            return result
 
         html_info = self.fetch_store_html_info(appid)
 
@@ -730,7 +794,7 @@ class SteamClient:
         )
 
         self._store_fetches += 1
-        return {
+        result = {
             "store_name": data.get("name"),
             "cn_title": html_info.get("cn_title") or data.get("name"),
             "description": html_info.get("description")
@@ -744,6 +808,8 @@ class SteamClient:
             "region": region,
             "cover_url": cover_url,
         }
+        self._store_results[appid] = result
+        return result
 
     def lookup_store_metadata(
         self, appid: int, account: Account, api_name: str | None
@@ -860,9 +926,10 @@ class SteamClient:
             for index, game in games.iterrows():
                 appid = int(game["appid"])
                 name = text_or_none(game.get("name")) or f"App {appid}"
-                LOG.info("[%s/%s] 处理 %s", index + 1, len(games), name)
+                LOG.debug("[%s/%s] 处理 %s", index + 1, len(games), name)
+                requests_before = self.http.request_count
                 records.append(self.build_record(account, game))
-                if self.config.request_delay:
+                if self.config.request_delay and self.http.request_count > requests_before:
                     time.sleep(self.config.request_delay)
 
         if self.store_metadata_cache:
@@ -872,13 +939,18 @@ class SteamClient:
                 self._store_cache_misses,
                 self._store_fetches,
             )
+        LOG.info(
+            "成就缓存：复用 %s，实际请求 %s",
+            self._achievement_cache_hits,
+            self._achievement_fetches,
+        )
         return pd.DataFrame(records)
 
     def build_record(self, account: Account, game: pd.Series) -> dict[str, Any]:
         appid = int(game["appid"])
         api_name = text_or_none(game.get("name"))
         store = self.get_store_info(appid, account, api_name)
-        achievements = self.get_achievements(account, appid)
+        achievements = self.achievements_for_game(account, game)
 
         minutes = number_or_none(game.get("playtime_forever"))
         hours = round(minutes / 60, 2) if minutes is not None else None
@@ -888,7 +960,7 @@ class SteamClient:
         achieved_achievements = achievements["achieved"]
         completion = (
             round(achieved_achievements / total_achievements, 4)
-            if total_achievements
+            if total_achievements and achieved_achievements is not None
             else None
         )
         content_type = store.get("content_type") or "其它"
@@ -1018,12 +1090,10 @@ class NotionClient:
 
         field_defs = FIELD_DEFS_CN if self.config.schema == "cn" else FIELD_DEFS_LEGACY
         db_props = self.ensure_database_schema(db_props, title_prop, field_defs)
-        existing_pages, key_property, store_metadata_cache = self.fetch_existing_pages(
-            db_props,
-            title_prop,
-            field_defs,
-        )
-        LOG.info("Notion 已有记录 %s 条", len(existing_pages))
+        (
+            existing_pages, key_property, store_metadata_cache, page_snapshots
+        ) = self.fetch_existing_pages(db_props, title_prop, field_defs)
+        LOG.info("Notion 已有记录 %s 条", len(page_snapshots))
         if store_metadata_cache:
             LOG.info("已从 Notion 读取商店元数据缓存 %s 条", len(store_metadata_cache))
         return NotionSyncContext(
@@ -1033,6 +1103,7 @@ class NotionClient:
             existing_pages=existing_pages,
             key_property=key_property,
             store_metadata_cache=store_metadata_cache,
+            page_snapshots=page_snapshots,
         )
 
     def fetch_existing_pages(
@@ -1040,16 +1111,20 @@ class NotionClient:
         db_props: dict[str, str],
         title_prop: str,
         field_defs: list[FieldDef],
-    ) -> tuple[dict[str, str], str | None, dict[str, dict[str, Any]]]:
+    ) -> tuple[
+        dict[str, str], str | None, dict[str, dict[str, Any]], dict[str, dict[str, Any]]
+    ]:
         key_property = choose_key_property(self.config.schema, db_props)
         account_property = choose_account_property(db_props) if self.config.use_account_field else None
         existing: dict[str, str] = {}
         store_metadata_cache: dict[str, dict[str, Any]] = {}
+        page_snapshots: dict[str, dict[str, Any]] = {}
         cursor = None
 
         while True:
             payload = self.query_database(cursor)
             for page in payload.get("results", []):
+                page_snapshots[page["id"]] = page
                 props = page.get("properties", {})
                 keys = page_keys_from_props(
                     props,
@@ -1071,32 +1146,62 @@ class NotionClient:
             if not payload.get("has_more"):
                 break
             cursor = payload.get("next_cursor")
-        return existing, key_property, store_metadata_cache
+        return existing, key_property, store_metadata_cache, page_snapshots
 
-    def create_page(self, properties: dict[str, Any], record: dict[str, Any]) -> None:
+    def create_page(
+        self, properties: dict[str, Any], record: dict[str, Any]
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "parent": {"database_id": self.config.notion_database_id},
             "properties": properties,
         }
         self.add_page_media(body, record)
-        self.http.request(
+        page = self.http.request(
             "POST",
             "https://api.notion.com/v1/pages",
             headers=self.headers,
             json=body,
-        )
+        ).json()
+        return merge_page_snapshot(None, body, page)
 
     def update_page(
-        self, page_id: str, properties: dict[str, Any], record: dict[str, Any]
-    ) -> None:
-        body: dict[str, Any] = {"properties": properties}
+        self,
+        page_id: str,
+        properties: dict[str, Any],
+        record: dict[str, Any],
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        changed_properties = properties
+        if snapshot is not None:
+            current_properties = snapshot.get("properties", {})
+            changed_properties = {
+                name: value
+                for name, value in properties.items()
+                if name not in current_properties
+                or normalize_notion_property(value)
+                != normalize_notion_property(current_properties[name])
+            }
+        body: dict[str, Any] = {}
+        if changed_properties:
+            body["properties"] = changed_properties
         self.add_page_media(body, record)
-        self.http.request(
+        if snapshot is not None:
+            for media in ("cover", "icon"):
+                if (
+                    media in body
+                    and normalize_notion_media(body[media])
+                    == normalize_notion_media(snapshot.get(media))
+                ):
+                    del body[media]
+        if not body:
+            return None
+        page = self.http.request(
             "PATCH",
             f"https://api.notion.com/v1/pages/{page_id}",
             headers=self.headers,
             json=body,
-        )
+        ).json()
+        return merge_page_snapshot(snapshot, body, page, page_id=page_id)
 
     def add_page_media(self, body: dict[str, Any], record: dict[str, Any]) -> None:
         cover = text_or_none(record.get("封面"))
@@ -1165,11 +1270,26 @@ class NotionClient:
 
             try:
                 if page_id:
-                    self.update_page(page_id, properties, record)
+                    page = self.update_page(
+                        page_id, properties, record, context.page_snapshots.get(page_id)
+                    )
+                    if page is None:
+                        skipped += 1
+                        LOG.debug("[%s/%s] 无变化，跳过 %s", index, len(df), display_name)
+                        continue
+                    context.page_snapshots[page_id] = page
+                    for key in keys:
+                        existing_pages[key] = page_id
                     updated += 1
                     LOG.info("[%s/%s] 更新 %s", index, len(df), display_name)
                 else:
-                    self.create_page(properties, record)
+                    page = self.create_page(properties, record)
+                    new_page_id = page.get("id")
+                    if not new_page_id:
+                        raise SyncError("Notion 新增页面响应缺少页面 ID")
+                    for key in keys:
+                        existing_pages[key] = new_page_id
+                    context.page_snapshots[new_page_id] = page
                     created += 1
                     LOG.info("[%s/%s] 新增 %s", index, len(df), display_name)
             except SyncError as exc:
@@ -1188,6 +1308,70 @@ class NotionClient:
         )
         if failed:
             raise SyncError(f"有 {failed} 条记录写入失败")
+
+
+def normalize_notion_property(prop: dict[str, Any]) -> Any:
+    """Compare writable values without Notion response IDs or display metadata."""
+    prop_type = prop.get("type")
+    if not prop_type:
+        prop_type = next(
+            (name for name in (
+                "title", "rich_text", "number", "date", "url", "files",
+                "multi_select", "select", "status", "checkbox",
+            ) if name in prop),
+            None,
+        )
+    value = prop.get(prop_type)
+    if prop_type in {"title", "rich_text"}:
+        value = "".join(
+            item.get("plain_text")
+            if item.get("plain_text") is not None
+            else (item.get("text") or {}).get("content", "")
+            for item in value or []
+        )
+    elif prop_type in {"select", "status"}:
+        value = (value or {}).get("name")
+    elif prop_type == "multi_select":
+        value = tuple(sorted({item.get("name") for item in value or [] if item.get("name")}))
+    elif prop_type == "files":
+        value = tuple(normalize_notion_media(item) for item in value or [])
+    elif prop_type == "date":
+        value = tuple((value or {}).get(key) for key in ("start", "end", "time_zone"))
+    elif prop_type not in {"number", "url", "checkbox"}:
+        return prop
+    return prop_type, value
+
+
+def normalize_notion_media(media: dict[str, Any] | None) -> Any:
+    if not media:
+        return None
+    media_type = media.get("type")
+    if media_type in {"external", "file"}:
+        return media_type, (media.get(media_type) or {}).get("url")
+    if media_type == "emoji":
+        return media_type, media.get("emoji")
+    return media
+
+
+def merge_page_snapshot(
+    snapshot: dict[str, Any] | None,
+    body: dict[str, Any],
+    page: dict[str, Any],
+    page_id: str | None = None,
+) -> dict[str, Any]:
+    """Keep successful writes visible to later records in the same run."""
+    merged = dict(snapshot or {})
+    properties = dict(merged.get("properties", {}))
+    properties.update(body.get("properties", {}))
+    properties.update(page.get("properties", {}))
+    for media in ("cover", "icon"):
+        if media in body:
+            merged[media] = body[media]
+    merged.update(page)
+    merged["properties"] = properties
+    if page_id and not merged.get("id"):
+        merged["id"] = page_id
+    return merged
 
 
 def get_game_status(record: dict[str, Any], abandoned_days: int = 180) -> str | None:
@@ -1236,6 +1420,62 @@ def status_from_last_played(
     if hours > 0:
         return "暂搁置"
     return "未开始"
+
+
+def refresh_due(appid: int, interval_days: int) -> bool:
+    # Spread cold-library refreshes across daily runs instead of a costly full scan.
+    # Steam AppIDs often end in zero, so using AppID % 30 would cluster requests.
+    bucket = int.from_bytes(
+        hashlib.blake2s(str(appid).encode("ascii"), digest_size=4).digest(), "big"
+    ) % interval_days
+    return bucket == date.today().toordinal() % interval_days
+
+
+def achievement_cache_key(appid: int, account_name: str, use_account_field: bool) -> str:
+    return f"{appid}_{account_name}" if use_account_field else str(appid)
+
+
+def achievement_cache_from_context(
+    context: NotionSyncContext,
+    use_account_field: bool,
+) -> dict[str, dict[str, Any]]:
+    cache: dict[str, dict[str, Any]] = {}
+    account_property = choose_account_property(context.db_props)
+    for page in context.page_snapshots.values():
+        props = page.get("properties", {})
+        values = {
+            field.record_key: extract_prop_value(props[field.notion_name])
+            for field in context.field_defs
+            if field.notion_name in props
+        }
+        appid = int_key(values.get("游戏ID"))
+        hours = number_or_none(values.get("总时长小时"))
+        total = number_or_none(values.get("成就总数"))
+        achieved = number_or_none(values.get("已解锁成就"))
+        account_name = (
+            text_or_none(extract_prop_value(props.get(account_property, {})))
+            if account_property else None
+        )
+        if (
+            not appid
+            or hours is None
+            or total is None
+            or achieved is None
+            or not 0 <= achieved <= total
+            or (use_account_field and not account_name)
+        ):
+            continue
+        key = achievement_cache_key(int(appid), account_name or "", use_account_field)
+        cache[key] = {
+            "hours": hours,
+            "last_played": parse_date(values.get("最后游玩")),
+            "achievements": {
+                "total": int(total),
+                "achieved": int(achieved),
+                "first_unlock": parse_date(values.get("首个成就时间")),
+            },
+        }
+    return cache
 
 
 def recently_played(last_played: str | None, days: int) -> bool:
@@ -1701,6 +1941,10 @@ def run(argv: list[str] | None = None) -> None:
         config,
         store_metadata_cache=(
             notion_context.store_metadata_cache if notion_context else None
+        ),
+        achievement_cache=(
+            achievement_cache_from_context(notion_context, config.use_account_field)
+            if notion_context else None
         ),
     )
     df = steam.build_dataframe()
